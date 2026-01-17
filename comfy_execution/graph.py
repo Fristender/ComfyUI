@@ -78,6 +78,11 @@ def get_input_info(
         tuple[str, str, dict] | tuple[None, None, None]: The input type, category, and extra info for the input name.
     """
 
+    # Exec-pins fork: treat `exec_in` as a universal optional input even if the node
+    # doesn't declare it in INPUT_TYPES().
+    if input_name == "exec_in":
+        return "EXECUTE", "optional", {}
+
     valid_inputs = valid_inputs or class_def.INPUT_TYPES()
     input_info = None
     input_category = None
@@ -335,3 +340,53 @@ class ExecutionList(TopologicalSort):
                 del blocked_by[node_id]
             to_remove = [node_id for node_id in blocked_by if len(blocked_by[node_id]) == 0]
         return list(blocked_by.keys())
+
+
+class ExecOnlyExecutionList(ExecutionList):
+    """
+    Exec-pins fork: scheduling dependencies come ONLY from `exec_in` links.
+
+    Data links are still used at runtime to fetch inputs from already-executed
+    nodes, but they do not affect which nodes are considered "ready".
+    """
+
+    def add_node(self, node_unique_id, include_lazy=False, subgraph_nodes=None):
+        # Only traverse exec pins. Everything else is ignored for scheduling.
+        # We support fan-in by allowing multiple exec inputs: exec_in, exec_in1, exec_in2, ...
+        node_ids = [node_unique_id]
+        links = []
+
+        while node_ids:
+            unique_id = node_ids.pop()
+            if unique_id in self.pendingNodes:
+                continue
+
+            self.pendingNodes[unique_id] = True
+            self.blockCount[unique_id] = 0
+            self.blocking[unique_id] = {}
+
+            inputs = self.dynprompt.get_node(unique_id)["inputs"]
+            for k, value in inputs.items():
+                if not isinstance(k, str) or not k.startswith("exec_in"):
+                    continue
+                if not is_link(value):
+                    continue
+                from_node_id, from_socket = value
+                if subgraph_nodes is not None and from_node_id not in subgraph_nodes:
+                    continue
+                if not self.is_cached(from_node_id):
+                    node_ids.append(from_node_id)
+                links.append((from_node_id, from_socket, unique_id))
+
+        for link in links:
+            self.add_strong_link(*link)
+
+    def get_cache(self, from_node_id, to_node_id):
+        """
+        Exec-pins fork: allow data links to read from any previously executed node,
+        even if it isn't an exec dependency of `to_node_id`.
+        """
+        v = super().get_cache(from_node_id, to_node_id)
+        if v is not None:
+            return v
+        return self.output_cache.get(from_node_id)

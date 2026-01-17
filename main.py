@@ -1,7 +1,15 @@
+import os
+import sys
+
+# Windows portable builds ship an embedded Python with a pre-baked sys.path that
+# can point at a different ComfyUI checkout. Ensure this repo's root is first.
+_COMFYUI_ROOT = os.path.dirname(os.path.realpath(__file__))
+if _COMFYUI_ROOT not in sys.path:
+    sys.path.insert(0, _COMFYUI_ROOT)
+
 import comfy.options
 comfy.options.enable_args_parsing()
 
-import os
 import importlib.util
 import folder_paths
 import time
@@ -11,7 +19,6 @@ from app.assets.scanner import seed_assets
 import itertools
 import utils.extra_config
 import logging
-import sys
 from comfy_execution.progress import get_progress_state
 from comfy_execution.utils import get_executing_context
 from comfy_api import feature_flags

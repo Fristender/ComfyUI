@@ -39,6 +39,8 @@ from comfy.cli_args import args
 
 import importlib
 
+from comfy_execution.graph_utils import ExecutionBlocker
+
 import folder_paths
 import latent_preview
 import node_helpers
@@ -1969,7 +1971,169 @@ class ImagePadForOutpaint:
         return (new_image, mask.unsqueeze(0))
 
 
+# -----------------------------------------------------------------------------
+# Exec-pins fork: minimal flow control nodes.
+#
+# Regular nodes get universal exec_in/exec_out sockets via server-side schema
+# injection, but these nodes provide explicit exec outputs (so they can have
+# multiple branches).
+# -----------------------------------------------------------------------------
+
+class ExecStart:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "start"
+    CATEGORY = "Flow"
+
+    # Tells the server schema injector to publish explicit exec outputs instead
+    # of appending the universal "exec_out".
+    EXEC_OUT_NAMES = ("exec",)
+
+    def start(self):
+        return tuple()
+
+
+class ExecEnd:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"exec_in": ("EXECUTE",)}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "end"
+    CATEGORY = "Flow"
+    OUTPUT_NODE = True
+
+    EXEC_OUT_NAMES = ("exec",)
+
+    def end(self, exec_in):
+        return tuple()
+
+
+class IfExec:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "exec_in": ("EXECUTE",),
+                "condition": ("BOOLEAN", {"default": True}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("EXECUTE", "EXECUTE")
+    RETURN_NAMES = ("then", "else")
+    FUNCTION = "doit"
+    CATEGORY = "Flow"
+
+    EXEC_OUT_NAMES = ("then", "else")
+
+    def doit(self, exec_in, condition, unique_id=None):
+        # If an upstream exec token is blocked, propagate the block through.
+        if isinstance(exec_in, ExecutionBlocker):
+            return (ExecutionBlocker(None), ExecutionBlocker(None))
+        if condition:
+            return (
+                ("_exec", {"from_node": unique_id, "branch": "then", "time": time.time()}),
+                ExecutionBlocker(None),
+            )
+        else:
+            return (
+                ExecutionBlocker(None),
+                ("_exec", {"from_node": unique_id, "branch": "else", "time": time.time()}),
+            )
+
+
+class SwitchExec4:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "exec_in": ("EXECUTE",),
+                "index": ("INT", {"default": 0, "min": 0, "max": 3}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("EXECUTE", "EXECUTE", "EXECUTE", "EXECUTE")
+    RETURN_NAMES = ("case0", "case1", "case2", "case3")
+    FUNCTION = "doit"
+    CATEGORY = "Flow"
+
+    EXEC_OUT_NAMES = ("case0", "case1", "case2", "case3")
+
+    def doit(self, exec_in, index, unique_id=None):
+        if isinstance(exec_in, ExecutionBlocker):
+            return (ExecutionBlocker(None),) * 4
+        outs = [ExecutionBlocker(None)] * 4
+        i = int(index)
+        if 0 <= i < 4:
+            outs[i] = ("_exec", {"from_node": unique_id, "branch": f"case{i}", "time": time.time()})
+        return tuple(outs)
+
+class ExecJoin2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "exec_in1": ("EXECUTE",),
+                "exec_in2": ("EXECUTE",),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("EXECUTE",)
+    RETURN_NAMES = ("exec_out",)
+    FUNCTION = "doit"
+    CATEGORY = "Flow"
+
+    EXEC_OUT_NAMES = ("exec_out",)
+
+    def doit(self, exec_in1, exec_in2, unique_id=None):
+        # OR-join: if any branch is active, allow execution to continue.
+        if isinstance(exec_in1, ExecutionBlocker) and isinstance(exec_in2, ExecutionBlocker):
+            return (ExecutionBlocker(None),)
+        return (("_exec", {"from_node": unique_id, "op": "join2", "time": time.time()}),)
+
+class ExecJoin4:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "exec_in1": ("EXECUTE",),
+                "exec_in2": ("EXECUTE",),
+                "exec_in3": ("EXECUTE",),
+                "exec_in4": ("EXECUTE",),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("EXECUTE",)
+    RETURN_NAMES = ("exec_out",)
+    FUNCTION = "doit"
+    CATEGORY = "Flow"
+
+    EXEC_OUT_NAMES = ("exec_out",)
+
+    def doit(self, exec_in1, exec_in2, exec_in3, exec_in4, unique_id=None):
+        if (
+            isinstance(exec_in1, ExecutionBlocker)
+            and isinstance(exec_in2, ExecutionBlocker)
+            and isinstance(exec_in3, ExecutionBlocker)
+            and isinstance(exec_in4, ExecutionBlocker)
+        ):
+            return (ExecutionBlocker(None),)
+        return (("_exec", {"from_node": unique_id, "op": "join4", "time": time.time()}),)
+
 NODE_CLASS_MAPPINGS = {
+    "ExecStart": ExecStart,
+    "ExecEnd": ExecEnd,
+    "IfExec": IfExec,
+    "SwitchExec4": SwitchExec4,
+    "ExecJoin2": ExecJoin2,
+    "ExecJoin4": ExecJoin4,
     "KSampler": KSampler,
     "CheckpointLoaderSimple": CheckpointLoaderSimple,
     "CLIPTextEncode": CLIPTextEncode,

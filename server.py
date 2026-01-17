@@ -652,36 +652,80 @@ class PromptServer():
         def node_info(node_class):
             obj_class = nodes.NODE_CLASS_MAPPINGS[node_class]
             if issubclass(obj_class, _ComfyNodeInternal):
-                return obj_class.GET_NODE_INFO_V1()
-            info = {}
-            info['input'] = obj_class.INPUT_TYPES()
-            info['input_order'] = {key: list(value.keys()) for (key, value) in obj_class.INPUT_TYPES().items()}
-            info['output'] = obj_class.RETURN_TYPES
-            info['output_is_list'] = obj_class.OUTPUT_IS_LIST if hasattr(obj_class, 'OUTPUT_IS_LIST') else [False] * len(obj_class.RETURN_TYPES)
-            info['output_name'] = obj_class.RETURN_NAMES if hasattr(obj_class, 'RETURN_NAMES') else info['output']
-            info['name'] = node_class
-            info['display_name'] = nodes.NODE_DISPLAY_NAME_MAPPINGS[node_class] if node_class in nodes.NODE_DISPLAY_NAME_MAPPINGS.keys() else node_class
-            info['description'] = obj_class.DESCRIPTION if hasattr(obj_class,'DESCRIPTION') else ''
-            info['python_module'] = getattr(obj_class, "RELATIVE_PYTHON_MODULE", "nodes")
-            info['category'] = 'sd'
-            if hasattr(obj_class, 'OUTPUT_NODE') and obj_class.OUTPUT_NODE == True:
-                info['output_node'] = True
+                info = obj_class.GET_NODE_INFO_V1()
             else:
-                info['output_node'] = False
+                info = {}
+                info['input'] = obj_class.INPUT_TYPES()
+                info['input_order'] = {key: list(value.keys()) for (key, value) in obj_class.INPUT_TYPES().items()}
+                info['output'] = obj_class.RETURN_TYPES
+                info['output_is_list'] = obj_class.OUTPUT_IS_LIST if hasattr(obj_class, 'OUTPUT_IS_LIST') else [False] * len(obj_class.RETURN_TYPES)
+                info['output_name'] = obj_class.RETURN_NAMES if hasattr(obj_class, 'RETURN_NAMES') else info['output']
+                info['name'] = node_class
+                info['display_name'] = nodes.NODE_DISPLAY_NAME_MAPPINGS[node_class] if node_class in nodes.NODE_DISPLAY_NAME_MAPPINGS.keys() else node_class
+                info['description'] = obj_class.DESCRIPTION if hasattr(obj_class,'DESCRIPTION') else ''
+                info['python_module'] = getattr(obj_class, "RELATIVE_PYTHON_MODULE", "nodes")
+                info['category'] = 'sd'
+                if hasattr(obj_class, 'OUTPUT_NODE') and obj_class.OUTPUT_NODE == True:
+                    info['output_node'] = True
+                else:
+                    info['output_node'] = False
 
-            if hasattr(obj_class, 'CATEGORY'):
-                info['category'] = obj_class.CATEGORY
+                if hasattr(obj_class, 'CATEGORY'):
+                    info['category'] = obj_class.CATEGORY
 
-            if hasattr(obj_class, 'OUTPUT_TOOLTIPS'):
-                info['output_tooltips'] = obj_class.OUTPUT_TOOLTIPS
+                if hasattr(obj_class, 'OUTPUT_TOOLTIPS'):
+                    info['output_tooltips'] = obj_class.OUTPUT_TOOLTIPS
 
-            if getattr(obj_class, "DEPRECATED", False):
-                info['deprecated'] = True
-            if getattr(obj_class, "EXPERIMENTAL", False):
-                info['experimental'] = True
+                if getattr(obj_class, "DEPRECATED", False):
+                    info['deprecated'] = True
+                if getattr(obj_class, "EXPERIMENTAL", False):
+                    info['experimental'] = True
 
-            if hasattr(obj_class, 'API_NODE'):
-                info['api_node'] = obj_class.API_NODE
+                if hasattr(obj_class, 'API_NODE'):
+                    info['api_node'] = obj_class.API_NODE
+
+            # -----------------------------------------------------------------
+            # Exec-pins fork: expose a universal `exec_in` input and `exec_out`
+            # output for every node. Some control-flow nodes provide their own
+            # exec outputs via `EXEC_OUT_NAMES` (e.g. IfExec/SwitchExec); for
+            # those, we don't append the universal exec_out.
+            # -----------------------------------------------------------------
+            inp = info.get("input") or {}
+            inp.setdefault("optional", {})
+            # If a node already defines any exec inputs (e.g. exec_in1/exec_in2 for joins),
+            # don't inject the universal exec_in.
+            existing_inputs = set()
+            for group in ("required", "optional", "hidden"):
+                existing_inputs.update((inp.get(group) or {}).keys())
+            has_any_exec_in = any(isinstance(k, str) and k.startswith("exec_in") for k in existing_inputs)
+            if (not has_any_exec_in) and "exec_in" not in inp.get("required", {}) and "exec_in" not in inp.get("optional", {}) and "exec_in" not in inp.get("hidden", {}):
+                inp["optional"]["exec_in"] = ("EXECUTE", {"tooltip": "Execution dependency. This controls execution order in exec-pins mode."})
+                info["input"] = inp
+                # Keep input_order in sync for V1-style info. V3 info may not
+                # include it; the frontend tolerates missing input_order.
+                if "input_order" in info:
+                    info["input_order"].setdefault("optional", [])
+                    if "exec_in" not in info["input_order"]["optional"]:
+                        info["input_order"]["optional"].append("exec_in")
+
+            exec_out_names = getattr(obj_class, "EXEC_OUT_NAMES", None)
+            if exec_out_names:
+                # Control-flow nodes define their exec outputs explicitly.
+                info["output"] = tuple(["EXECUTE"] * len(exec_out_names))
+                info["output_name"] = tuple(exec_out_names)
+                info["output_is_list"] = [False] * len(exec_out_names)
+            else:
+                # For regular nodes, append one virtual exec output socket.
+                out = list(info.get("output") or ())
+                out_names = list(info.get("output_name") or out)
+                out_is_list = list(info.get("output_is_list") or ([False] * len(out)))
+                out.append("EXECUTE")
+                out_names.append("exec_out")
+                out_is_list.append(False)
+                info["output"] = tuple(out)
+                info["output_name"] = tuple(out_names)
+                info["output_is_list"] = out_is_list
+
             return info
 
         @routes.get("/object_info")

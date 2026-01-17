@@ -28,6 +28,7 @@ from comfy_execution.graph import (
     DynamicPrompt,
     ExecutionBlocker,
     ExecutionList,
+    ExecOnlyExecutionList,
     get_input_info,
 )
 from comfy_execution.graph_utils import GraphBuilder, is_link
@@ -146,6 +147,7 @@ class CacheSet:
 SENSITIVE_EXTRA_DATA_KEYS = ("auth_token_comfy_org", "api_key_comfy_org")
 
 def get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=None, extra_data={}):
+    strict_exec_pins = bool(extra_data.get("__exec_pins_mode__", False))
     is_v3 = issubclass(class_def, _ComfyNodeInternal)
     v3_data: io.V3Data = {}
     hidden_inputs_v3 = {}
@@ -168,9 +170,13 @@ def get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=
                 continue # This might be a lazily-evaluated input
             cached = execution_list.get_cache(input_unique_id, unique_id)
             if cached is None or cached.outputs is None:
+                if strict_exec_pins:
+                    raise RuntimeError(f"Missing upstream output for link input '{x}' on node {unique_id}: source node {input_unique_id} has not executed.")
                 mark_missing()
                 continue
             if output_index >= len(cached.outputs):
+                if strict_exec_pins:
+                    raise RuntimeError(f"Invalid output index {output_index} for link input '{x}' on node {unique_id}: source node {input_unique_id} has only {len(cached.outputs)} outputs.")
                 mark_missing()
                 continue
             obj = cached.outputs[output_index]
@@ -213,6 +219,29 @@ def get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=
 
 map_node_over_list = None #Don't hook this please
 
+def _filter_kwargs_for_callable(f, kwargs: dict):
+    """
+    Exec-pins fork: nodes receive a universal `exec_in` input in prompts, but
+    most node functions don't accept it. Filter kwargs to what the callable
+    declares unless it has **kwargs.
+    """
+    try:
+        spec = inspect.getfullargspec(f)
+    except Exception:
+        return kwargs
+
+    # If the function accepts **kwargs, don't filter.
+    if spec.varkw is not None:
+        return kwargs
+
+    allowed = set(spec.args or [])
+    # Bound methods usually include "self" in args; drop it.
+    if allowed:
+        allowed.discard("self")
+
+    allowed.update(spec.kwonlyargs or [])
+    return {k: v for k, v in kwargs.items() if k in allowed}
+
 async def resolve_map_node_over_list_results(results):
     remaining = [x for x in results if isinstance(x, asyncio.Task) and not x.done()]
     if len(remaining) == 0:
@@ -243,6 +272,12 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
         if allow_interrupt:
             nodes.before_node_execution()
         execution_block = None
+        # Exec-pins fork: `ExecutionBlocker(None)` is used to represent an inactive
+        # exec branch. For nodes with multiple exec inputs (exec_in1/exec_in2/...),
+        # we only want to block execution if *all* exec inputs are blocked.
+        exec_in_total = 0
+        exec_in_blocked = 0
+        exec_in_block_sample = None
         for k, v in inputs.items():
             if input_is_list:
                 for e in v:
@@ -250,8 +285,20 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                         v = e
                         break
             if isinstance(v, ExecutionBlocker):
+                if isinstance(k, str) and k.startswith("exec_in"):
+                    exec_in_total += 1
+                    exec_in_blocked += 1
+                    exec_in_block_sample = v
+                    continue
                 execution_block = execution_block_cb(v) if execution_block_cb else v
                 break
+            if isinstance(k, str) and k.startswith("exec_in"):
+                exec_in_total += 1
+
+        if execution_block is None and exec_in_total > 0 and exec_in_blocked == exec_in_total:
+            # All exec inputs are blocked -> treat as an exec-pins no-op.
+            v = exec_in_block_sample or ExecutionBlocker(None)
+            execution_block = execution_block_cb(v) if execution_block_cb else v
         if execution_block is None:
             if pre_execute_cb is not None and index is not None:
                 pre_execute_cb(index)
@@ -268,6 +315,10 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                     type_obj.VALIDATE_CLASS()
                     class_clone = type_obj.PREPARE_CLASS_CLONE(v3_data)
                 f = make_locked_method_func(type_obj, func, class_clone)
+                # Exec-pins fork: never pass exec pins into v3 node methods unless
+                # the node explicitly declared them (we inject exec pins at the
+                # schema level, so most nodes don't accept these kwargs).
+                inputs = {k: v for k, v in inputs.items() if not (isinstance(k, str) and k.startswith("exec_in"))}
                 # in case of dynamic inputs, restructure inputs to expected nested dict
                 if v3_data is not None:
                     inputs = _io.build_nested_inputs(inputs, v3_data)
@@ -277,7 +328,7 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
             if inspect.iscoroutinefunction(f):
                 async def async_wrapper(f, prompt_id, unique_id, list_index, args):
                     with CurrentNodeContext(prompt_id, unique_id, list_index):
-                        return await f(**args)
+                        return await f(**_filter_kwargs_for_callable(f, args))
                 task = asyncio.create_task(async_wrapper(f, prompt_id, unique_id, index, args=inputs))
                 # Give the task a chance to execute without yielding
                 await asyncio.sleep(0)
@@ -288,7 +339,7 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                     results.append(task)
             else:
                 with CurrentNodeContext(prompt_id, unique_id, index):
-                    result = f(**inputs)
+                    result = f(**_filter_kwargs_for_callable(f, inputs))
                 results.append(result)
         else:
             results.append(execution_block)
@@ -414,16 +465,7 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
     inputs = dynprompt.get_node(unique_id)['inputs']
     class_type = dynprompt.get_node(unique_id)['class_type']
     class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
-    cached = caches.outputs.get(unique_id)
-    if cached is not None:
-        if server.client_id is not None:
-            cached_ui = cached.ui or {}
-            server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": cached_ui.get("output",None), "prompt_id": prompt_id }, server.client_id)
-            if cached.ui is not None:
-                ui_outputs[unique_id] = cached.ui
-        get_progress_state().finish_progress(unique_id)
-        execution_list.cache_update(unique_id, cached)
-        return (ExecutionResult.SUCCESS, None, None)
+    # Exec-pins fork: always execute nodes; do not short-circuit via caches.
 
     input_data_all = None
     try:
@@ -466,6 +508,20 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
         else:
             get_progress_state().start_progress(unique_id)
             input_data_all, missing_keys, v3_data = get_input_data(inputs, class_def, unique_id, execution_list, dynprompt, extra_data)
+            # Optional: set `extra_data["__exec_pins_debug__"]=True` to log why nodes are skipped.
+            if extra_data.get("__exec_pins_debug__", False):
+                try:
+                    exec_vals = []
+                    for k, v in (input_data_all or {}).items():
+                        if isinstance(k, str) and k.startswith("exec_in"):
+                            vv = v
+                            if isinstance(vv, list) and len(vv) > 0:
+                                vv = vv[0]
+                            exec_vals.append(vv)
+                    if exec_vals and all(isinstance(x, ExecutionBlocker) for x in exec_vals):
+                        logging.info(f"[execpins] node {unique_id} ({class_type}) blocked by exec inputs")
+                except Exception:
+                    pass
             if server.client_id is not None:
                 server.last_node_id = display_node_id
                 server.send_sync("executing", { "node": unique_id, "display_node": display_node_id, "prompt_id": prompt_id }, server.client_id)
@@ -572,6 +628,50 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                 execution_list.add_strong_link(link[0], link[1], unique_id)
             pending_subgraph_results[unique_id] = cached_outputs
             return (ExecutionResult.PENDING, None, None)
+
+        # Exec-pins fork: synthesize virtual EXECUTE outputs so exec links can be used
+        # as scheduling dependencies and runtime ordering constraints.
+        exec_out_names = getattr(class_def, "EXEC_OUT_NAMES", None)
+        # Determine whether this node was blocked by an upstream exec blocker.
+        # Propagate exec blockers through any exec input (exec_in, exec_in1, ...).
+        blocked = False
+        if input_data_all is not None:
+            for k, v in input_data_all.items():
+                if not isinstance(k, str) or not k.startswith("exec_in"):
+                    continue
+                vv = v
+                if isinstance(vv, list) and len(vv) > 0:
+                    vv = vv[0]
+                if isinstance(vv, ExecutionBlocker):
+                    blocked = True
+                    break
+
+        def make_exec_token(output_name: str):
+            if blocked:
+                return [ExecutionBlocker(None)]
+            return [(
+                "_exec",
+                {
+                    "prompt_id": prompt_id,
+                    "from_node": unique_id,
+                    "display_node": display_node_id,
+                    "output": output_name,
+                    "time": time.time(),
+                },
+            )]
+
+        if exec_out_names:
+            # Control-flow nodes define their exec outputs explicitly. If the node
+            # didn't return matching outputs, generate them.
+            if not isinstance(output_data, list):
+                output_data = list(output_data)
+            if len(output_data) != len(exec_out_names):
+                output_data = [make_exec_token(name) for name in exec_out_names]
+        else:
+            # Regular nodes get one universal exec_out appended after their native outputs.
+            if not isinstance(output_data, list):
+                output_data = list(output_data)
+            output_data.append(make_exec_token("exec_out"))
 
         cache_entry = CacheEntry(ui=ui_outputs.get(unique_id), outputs=output_data)
         execution_list.cache_update(unique_id, cache_entry)
@@ -691,6 +791,11 @@ class PromptExecutor:
             add_progress_handler(WebUIProgressHandler(self.server))
             is_changed_cache = IsChangedCache(prompt_id, dynamic_prompt, self.caches.outputs)
             for cache in self.caches.all:
+                # Exec-pins fork: always re-execute every node, so clear caches between runs.
+                if hasattr(cache, "cache"):
+                    cache.cache = {}
+                if hasattr(cache, "subcaches"):
+                    cache.subcaches = {}
                 await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
                 cache.clean_unused()
 
@@ -707,7 +812,55 @@ class PromptExecutor:
             pending_async_nodes = {} # TODO - Unify this with pending_subgraph_results
             ui_node_outputs = {}
             executed = set()
-            execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
+            if extra_data.get("__exec_pins_debug__", False):
+                logging.info(f"[execpins] outputs_to_execute={list(execute_outputs)}")
+            # Exec-pins fork:
+            # - If the prompt includes explicit exec wiring, schedule only by `exec_in`.
+            # - Otherwise, auto-generate a linear exec chain based on legacy scheduling order.
+            has_exec_wiring = any("exec_in" in prompt[nid].get("inputs", {}) for nid in prompt)
+            if not has_exec_wiring:
+                tmp = ExecutionList(dynamic_prompt, self.caches.outputs)
+                for node_id in list(execute_outputs):
+                    tmp.add_node(node_id)
+                derived_order = []
+                while not tmp.is_empty():
+                    node_id, error, ex = await tmp.stage_node_execution()
+                    if error is not None or node_id is None:
+                        break
+                    derived_order.append(node_id)
+                    tmp.complete_node_execution()
+
+                # Wire exec_in for every node after the first. This does not persist;
+                # it only mutates the in-memory prompt for this run.
+                for prev, cur in zip(derived_order, derived_order[1:]):
+                    prev_class = nodes.NODE_CLASS_MAPPINGS[prompt[prev]["class_type"]]
+                    if issubclass(prev_class, _ComfyNodeInternal):
+                        prev_out_index = len((prev_class.GET_NODE_INFO_V1() or {}).get("output", ()))
+                    else:
+                        prev_out_index = len(getattr(prev_class, "RETURN_TYPES", ()))
+                    prompt[cur].setdefault("inputs", {})
+                    prompt[cur]["inputs"]["exec_in"] = [prev, prev_out_index]
+
+                # DynamicPrompt references the same dict; no rebuild needed.
+
+            extra_data["__exec_pins_mode__"] = True
+            execution_list = ExecOnlyExecutionList(dynamic_prompt, self.caches.outputs)
+
+            # Exec-pins fork: each exec output can only connect to one exec input.
+            exec_consumers = {}
+            for to_id, node in prompt.items():
+                inp = node.get("inputs", {})
+                v = inp.get("exec_in", None)
+                if is_link(v):
+                    from_id, from_slot = v[0], v[1]
+                    key = (from_id, int(from_slot))
+                    exec_consumers.setdefault(key, []).append(to_id)
+            for (from_id, from_slot), tos in exec_consumers.items():
+                if len(tos) > 1:
+                    raise RuntimeError(
+                        f"exec_out must have only one connection: node {from_id} output {from_slot} feeds {tos}. "
+                        "Use a Fork/Switch/If node to split, or chain nodes explicitly."
+                    )
             current_outputs = self.caches.outputs.all_node_ids()
             for node_id in list(execute_outputs):
                 execution_list.add_node(node_id)
@@ -719,6 +872,11 @@ class PromptExecutor:
                     break
 
                 assert node_id is not None, "Node ID should not be None at this point"
+                if extra_data.get("__exec_pins_debug__", False):
+                    try:
+                        logging.info(f"[execpins] exec node {node_id} ({prompt[node_id].get('class_type')})")
+                    except Exception:
+                        pass
                 result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs)
                 self.success = result != ExecutionResult.FAILURE
                 if result == ExecutionResult.FAILURE:
@@ -816,8 +974,18 @@ async def validate_inputs(prompt_id, prompt, item, validated):
 
             o_id = val[0]
             o_class_type = prompt[o_id]['class_type']
-            r = nodes.NODE_CLASS_MAPPINGS[o_class_type].RETURN_TYPES
-            received_type = r[val[1]]
+            o_cls = nodes.NODE_CLASS_MAPPINGS[o_class_type]
+            # V3 nodes don't reliably expose RETURN_TYPES; use V1 node info in that case.
+            if issubclass(o_cls, _ComfyNodeInternal):
+                r = tuple((o_cls.GET_NODE_INFO_V1() or {}).get("output", ()))
+            else:
+                r = getattr(o_cls, "RETURN_TYPES", ())
+            slot_index = int(val[1])
+            # Exec-pins fork: allow a virtual exec_out at index == len(native RETURN_TYPES).
+            if input_type == "EXECUTE" and slot_index == len(r):
+                received_type = "EXECUTE"
+            else:
+                received_type = r[slot_index]
             received_types[x] = received_type
             if 'input_types' not in validate_function_inputs and not validate_node_input(received_type, input_type):
                 details = f"{x}, received_type({received_type}) mismatch input_type({input_type})"
